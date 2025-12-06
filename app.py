@@ -29,6 +29,32 @@ city_models = {
     # Add more cities as needed
 }
 
+# Compatibility fix for tree estimators: some scikit-learn versions expect a
+# `monotonic_cst` attribute on DecisionTree objects. Models pickled with a
+# different scikit-learn version may not have this attribute which causes an
+# AttributeError during prediction (see stack trace referencing
+# `self.monotonic_cst`). Ensure the attribute exists on loaded models and on
+# individual estimators inside ensemble models.
+for info in city_models.values():
+    m = info.get("model")
+    if m is None:
+        continue
+    # If it's an ensemble (RandomForest), ensure each tree estimator has the attr
+    estimators = getattr(m, 'estimators_', None)
+    if estimators is not None:
+        for est in estimators:
+            if not hasattr(est, 'monotonic_cst'):
+                try:
+                    setattr(est, 'monotonic_cst', None)
+                except Exception:
+                    pass
+    # Also ensure the top-level model object has the attribute (safe no-op)
+    if not hasattr(m, 'monotonic_cst'):
+        try:
+            setattr(m, 'monotonic_cst', None)
+        except Exception:
+            pass
+
 # Replace this with your OpenAQ API key
 api_key = "9122142749f2d354a43af188bc4486a59f678eed"
 
@@ -76,7 +102,7 @@ if page == "Home":
 
     # Home Page Content
 
-    st.title("Welcome to Air Pulse pro")
+    st.title("Welcome to VayuVision")
 
     st.markdown("""
     This app allows you to predict the Air Quality Index (AQI) for different cities and provides insights into the potential health consequences based on the predicted AQI.
@@ -254,6 +280,19 @@ elif page == "Health Prediction":
 
     with open('model_vulnerable.pkl', 'rb') as file:
         model_vulnerable = pickle.load(file)
+
+    # Compatibility fix: some scikit-learn versions expect a 'monotonic_cst' attribute
+    # on DecisionTreeClassifier objects. If the attribute is missing (for example
+    # when loading models pickled with a different scikit-learn version), set it
+    # to None so prediction code that checks it won't fail.
+    for _m in (model_health, model_general, model_vulnerable):
+        if not hasattr(_m, 'monotonic_cst'):
+            try:
+                setattr(_m, 'monotonic_cst', None)
+            except Exception:
+                # If for some reason setting the attribute fails, continue — the
+                # prediction call will raise a clearer error later.
+                pass
 
     health_prediction = model_health.predict([[st.session_state.aqi]])
     st.write(f'Predicted for Overall Population Consequences: {health_prediction[0]}')
