@@ -54,6 +54,20 @@ for info in city_models.values():
             setattr(m, 'monotonic_cst', None)
         except Exception:
             pass
+    
+    # Fix for SimpleImputer compatibility: scikit-learn 1.8.0+ expects _fill_dtype attribute
+    # but models pickled with older versions (1.3.2) don't have it
+    imputer = info.get("imputer")
+    if imputer is not None and not hasattr(imputer, '_fill_dtype'):
+        try:
+            import numpy as np
+            # Infer the fill dtype from the statistics_ array
+            if hasattr(imputer, 'statistics_'):
+                setattr(imputer, '_fill_dtype', imputer.statistics_.dtype)
+            else:
+                setattr(imputer, '_fill_dtype', np.float64)
+        except Exception:
+            pass
 
 # Replace this with your OpenAQ API key
 api_key = "9122142749f2d354a43af188bc4486a59f678eed"
