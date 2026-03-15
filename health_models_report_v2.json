@@ -1,0 +1,27 @@
+{
+  "dataset_rows": 198,
+  "features": [
+    "AQI",
+    "AQI_BAND"
+  ],
+  "models": [
+    {
+      "target": "Health_Consequences",
+      "model_file": "model_health_v2.pkl",
+      "accuracy": 1.0,
+      "f1_weighted": 1.0
+    },
+    {
+      "target": "General_Population",
+      "model_file": "model_general_v2.pkl",
+      "accuracy": 1.0,
+      "f1_weighted": 1.0
+    },
+    {
+      "target": "Vulnerable_Population",
+      "model_file": "model_vulnerable_v2.pkl",
+      "accuracy": 0.975,
+      "f1_weighted": 0.9756
+    }
+  ]
+}
