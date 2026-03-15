@@ -1,4 +1,4 @@
-# Air-Pulse — project requirements and run instructions
+# Vayu vision — project requirements and run instructions
 
 **Python version**: Use Python 3.11 (recommended). Python 3.14 may require building native wheels (pyarrow) and can fail on Windows.
 
