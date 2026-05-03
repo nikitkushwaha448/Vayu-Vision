@@ -1,0 +1,10 @@
+city,source,pm25,pm10,o3,no2,so2,co,estimated_aqi
+Mumbai,WAQI,66,41,11.6,2.1,11.9,2.3,156.4
+Punjab,WAQI,,,,,,,
+Sanjay Nagar, Ghaziabad, India,WAQI,157,198,3.5,39.1,0.6,7.8,207.4
+Talkatora, Lucknow, India,WAQI,179,142,13.3,12.1,1.6,28.5,229.2
+Ahmedabad,WAQI,111,68,20,33.4,43.2,4.5,179.7
+Gurgaon,WAQI,152,78,1.9,9.2,1.7,19.6,202.5
+Kerala,WAQI,,,,,,,
+Nagaland,WAQI,,,,,,,
+Chennai,WAQI,61,25,7,5.6,2.1,4.7,153.8

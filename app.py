@@ -4,96 +4,24 @@ import pandas as pd
 import numpy as np
 import joblib
 import pickle
-import base64
 import json
-import matplotlib.pyplot as plt
+import base64
 from pathlib import Path
+from datetime import datetime
 
-from analysis import (
-    process_pollutant,
-    monthly_analysis,
-    monthly_trend_analysis,
-)
+import matplotlib.pyplot as plt
 
-BASE_DIR = Path(__file__).resolve().parent
-NO_LOCAL_MODEL_MESSAGE = "No local trained model available for this city yet, showing live AQI from WAQI."
+import config
+import realtime_api
 
-
-def local_file(name):
-    return BASE_DIR / name
+from analysis import monthly_analysis, monthly_trend_analysis, process_pollutant
 
 
-def load_city_history(city_name):
-    city_file = city_data_map.get(city_name)
-    if not city_file:
-        return None
-
-    city_file_path = local_file(city_file)
-    if not city_file_path.exists():
-        return None
-
-    df = pd.read_csv(city_file_path)
-    if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-
-    numeric_columns = ['pm25', 'pm10', 'o3', 'no2', 'so2', 'co', 'AQI']
-    for column in numeric_columns:
-        if column in df.columns:
-            df[column] = pd.to_numeric(df[column], errors='coerce')
-
-    return df
+def local_file(filename):
+    return Path(__file__).resolve().with_name(filename)
 
 
-def get_aqi_status(aqi_value):
-    if aqi_value <= 50:
-        return 'Good', 'green'
-    if aqi_value <= 100:
-        return 'Moderate', '#d4b000'
-    if aqi_value <= 150:
-        return 'Unhealthy for Sensitive Groups', '#d97706'
-    if aqi_value <= 200:
-        return 'Unhealthy', 'red'
-    if aqi_value <= 300:
-        return 'Very Unhealthy', 'orange'
-    return 'Hazardous', '#6b21a8'
-
-
-def get_health_actions(aqi_value):
-    if aqi_value <= 50:
-        return [
-            'Outdoor activity is generally safe.',
-            'Keep ventilation normal and maintain routine monitoring.',
-            'Sensitive individuals can continue normal activity.'
-        ]
-    if aqi_value <= 100:
-        return [
-            'Reduce very long outdoor exertion if irritation starts.',
-            'Keep windows open during cleaner hours when possible.',
-            'Sensitive groups should monitor breathing discomfort.'
-        ]
-    if aqi_value <= 150:
-        return [
-            'Sensitive groups should limit prolonged outdoor exposure.',
-            'Prefer indoor exercise or lower-intensity activity.',
-            'Use a mask outdoors if exposure cannot be avoided.'
-        ]
-    if aqi_value <= 200:
-        return [
-            'Limit outdoor activity for everyone, especially children and older adults.',
-            'Keep indoor air cleaner using filtration or closed windows during peak pollution.',
-            'Use protective masks outdoors and avoid traffic-heavy areas.'
-        ]
-    if aqi_value <= 300:
-        return [
-            'Avoid outdoor exercise and keep exposure short.',
-            'Sensitive groups should stay indoors as much as possible.',
-            'Use air purifiers if available and seek medical advice for persistent symptoms.'
-        ]
-    return [
-        'Stay indoors except for essential travel.',
-        'Use sealed indoor spaces with filtration if available.',
-        'Seek medical help promptly if breathing distress, chest tightness, or severe irritation occurs.'
-    ]
+NO_LOCAL_MODEL_MESSAGE = 'No local model is available for this city yet. Showing live AQI fallback where possible.'
 
 
 def calculate_personal_aqi_risk(aqi_value, outdoor_hours, sensitivity_points, mask_type, has_purifier):
@@ -169,84 +97,171 @@ def evaluate_symptom_urgency(aqi_value, selected_symptoms):
     return 'low', 'No major symptoms selected. Continue preventive steps and monitor for changes.'
 
 
+def load_city_history(city_name):
+    city_file = city_data_map.get(city_name)
+    if not city_file:
+        return pd.DataFrame()
+
+    city_file_path = local_file(city_file)
+    if not city_file_path.exists():
+        return pd.DataFrame()
+
+    try:
+        return pd.read_csv(city_file_path)
+    except Exception:
+        return pd.DataFrame()
+
+
 def build_safe_outdoor_time_plan(aqi_value, personal_risk_level):
-    base_minutes = {
-        'Morning (6-9 AM)': 90,
-        'Midday (10 AM-3 PM)': 45,
-        'Evening (4-8 PM)': 70,
-        'Night (after 8 PM)': 80,
-    }
+    aqi_value = float(aqi_value)
+    risk_multiplier = 1.0
+    if personal_risk_level == 'High':
+        risk_multiplier = 0.75
+    elif personal_risk_level == 'Very High':
+        risk_multiplier = 0.55
+    elif personal_risk_level == 'Moderate':
+        risk_multiplier = 0.9
 
-    if aqi_value <= 100:
-        aqi_factor = 1.0
-    elif aqi_value <= 150:
-        aqi_factor = 0.75
-    elif aqi_value <= 200:
-        aqi_factor = 0.55
-    elif aqi_value <= 300:
-        aqi_factor = 0.35
-    else:
-        aqi_factor = 0.2
-
-    risk_factor = {
-        'Low': 1.0,
-        'Moderate': 0.85,
-        'High': 0.65,
-        'Very High': 0.45,
-    }.get(personal_risk_level, 0.85)
+    base_minutes = max(10, int(round((110.0 - min(aqi_value, 350.0) * 0.3) * risk_multiplier)))
+    time_windows = [
+        ('Early morning', 1.00),
+        ('Mid-morning', 0.85),
+        ('Afternoon', 0.70),
+        ('Evening', 0.80),
+    ]
 
     rows = []
-    for window, minutes in base_minutes.items():
-        allowed_minutes = int(round(minutes * aqi_factor * risk_factor))
-        if allowed_minutes >= 60:
-            guidance = 'Preferred window'
-        elif allowed_minutes >= 30:
-            guidance = 'Limit exposure and use mask'
-        elif allowed_minutes >= 10:
-            guidance = 'Short essential exposure only'
+    for window_label, window_factor in time_windows:
+        minutes = max(5, int(round(base_minutes * window_factor)))
+        if aqi_value > 200:
+            advice = 'Keep exposure brief'
+        elif aqi_value > 150:
+            advice = 'Use caution'
+        elif aqi_value > 100:
+            advice = 'Prefer short sessions'
         else:
-            guidance = 'Avoid outdoor exposure'
-
-        rows.append(
-            {
-                'time_window': window,
-                'recommended_minutes': max(0, allowed_minutes),
-                'guidance': guidance,
-            }
-        )
+            advice = 'Generally safe'
+        rows.append({'time_window': window_label, 'recommended_minutes': minutes, 'advice': advice})
 
     return pd.DataFrame(rows)
 
 
-def build_commute_safety_plan(aqi_value, personal_risk_level, group_mode, commute_minutes, travel_mode):
-    if aqi_value <= 100:
-        aqi_factor = 1.0
-    elif aqi_value <= 150:
-        aqi_factor = 0.8
-    elif aqi_value <= 200:
-        aqi_factor = 0.6
-    elif aqi_value <= 300:
-        aqi_factor = 0.4
-    else:
-        aqi_factor = 0.25
+def build_commute_safety_plan(aqi_value, personal_risk_level, commute_group, commute_minutes, travel_mode):
+    aqi_value = float(aqi_value)
+    commute_minutes = float(commute_minutes)
 
-    risk_factor = {
-        'Low': 1.0,
-        'Moderate': 0.85,
-        'High': 0.7,
-        'Very High': 0.55,
-    }.get(personal_risk_level, 0.85)
+    aqi_factor = 1.0 + min(aqi_value, 350.0) / 300.0
+    risk_factor = 1.0
+    if personal_risk_level == 'High':
+        risk_factor = 1.2
+    elif personal_risk_level == 'Very High':
+        risk_factor = 1.4
+    elif personal_risk_level == 'Moderate':
+        risk_factor = 1.05
 
-    mode_factor = {
-        'Walking': 1.25,
-        'Two-wheeler': 1.15,
-        'Public Transport': 1.0,
-        'Car (windows closed)': 0.75,
-        'School Bus': 0.85,
+    travel_factor = {
+        'Walking': 1.35,
+        'Two-wheeler': 1.25,
+        'Public Transport': 1.10,
+        'Car (windows closed)': 0.85,
+        'School Bus': 0.90,
     }.get(travel_mode, 1.0)
 
-    commute_load = round(float(aqi_value) * (commute_minutes / 60.0) * mode_factor, 1)
-    tolerated_load = 120.0 * aqi_factor * risk_factor
+    commute_load = round(commute_minutes * aqi_factor * risk_factor * travel_factor, 1)
+    tolerated_load = round(max(35.0, 95.0 - min(aqi_value, 300.0) * 0.18), 1)
+
+    if commute_load <= tolerated_load * 0.8:
+        commute_status = 'Safer'
+    elif commute_load <= tolerated_load:
+        commute_status = 'Caution'
+    else:
+        commute_status = 'High Risk'
+
+    if commute_group == 'School':
+        key_actions = [
+            'Prefer school bus or closed-vehicle commute over walking near heavy roads.',
+            'Pack a child-size mask and ensure proper fit before departure.',
+            'Schedule outdoor sports only in lower AQI windows when possible.',
+        ]
+    elif commute_group == 'Office':
+        key_actions = [
+            'Shift commute outside peak traffic times where possible.',
+            'Prefer closed cabin transport and avoid open-road exposure during delays.',
+            'Use indoor breaks before and after commute to reduce cumulative exposure.',
+        ]
+    else:
+        key_actions = [
+            'Use the shortest low-traffic route to reduce exposure duration.',
+            'Use N95/FFP2 on high AQI days and avoid exertion during travel.',
+            'Plan essential trips during safer windows from the time plan.',
+        ]
+
+    route_windows = pd.DataFrame(
+        [
+            {'window': '6-8 AM', 'score': round(70 * aqi_factor / risk_factor, 1)},
+            {'window': '8-10 AM', 'score': round(45 * aqi_factor / risk_factor, 1)},
+            {'window': '5-7 PM', 'score': round(40 * aqi_factor / risk_factor, 1)},
+            {'window': '7-9 PM', 'score': round(62 * aqi_factor / risk_factor, 1)},
+        ]
+    )
+    route_windows['advice'] = route_windows['score'].apply(
+        lambda x: 'Better option' if x >= 55 else ('Use mask + short route' if x >= 30 else 'Avoid if possible')
+    )
+
+    return {
+        'commute_load': commute_load,
+        'tolerated_load': tolerated_load,
+        'commute_status': commute_status,
+        'key_actions': key_actions,
+        'route_windows': route_windows,
+    }
+
+
+def evaluate_symptom_urgency(aqi_value, selected_symptoms):
+    severe_markers = {'Shortness of breath', 'Chest pain', 'Severe wheezing', 'Faintness'}
+    moderate_markers = {'Persistent cough', 'Eye irritation', 'Headache', 'Throat irritation'}
+
+    symptom_set = set(selected_symptoms)
+    has_severe = len(symptom_set.intersection(severe_markers)) > 0
+    has_moderate = len(symptom_set.intersection(moderate_markers)) > 0
+
+    if has_severe:
+        return 'urgent', 'Severe symptoms detected. Seek medical care immediately, especially with current AQI conditions.'
+    if has_moderate and aqi_value > 150:
+        return 'high', 'Symptoms plus elevated AQI detected. Minimize exposure and consult a clinician if symptoms persist.'
+    if has_moderate:
+        return 'medium', 'Mild-to-moderate symptoms detected. Reduce exposure, hydrate, and monitor progression.'
+    return 'low', 'No major symptoms selected. Continue preventive steps and monitor for changes.'
+
+
+def get_aqi_status(aqi_value):
+    aqi_value = float(aqi_value)
+    if aqi_value <= 50:
+        return 'Good', '#1f9d55'
+    if aqi_value <= 100:
+        return 'Moderate', '#f4c430'
+    if aqi_value <= 150:
+        return 'Unhealthy for Sensitive Groups', '#f97316'
+    if aqi_value <= 200:
+        return 'Unhealthy', '#dc2626'
+    if aqi_value <= 300:
+        return 'Very Unhealthy', '#7c3aed'
+    return 'Hazardous', '#991b1b'
+
+
+def get_health_actions(aqi_value):
+    aqi_value = float(aqi_value)
+    if aqi_value <= 50:
+        return ['Air quality is good. Normal outdoor activity is fine.']
+    if aqi_value <= 100:
+        return ['Sensitive people should watch for irritation.', 'Keep strenuous outdoor activity moderate.']
+    if aqi_value <= 150:
+        return ['Limit prolonged outdoor exertion.', 'Sensitive groups should reduce exposure.']
+    if aqi_value <= 200:
+        return ['Reduce outdoor time.', 'Use protection if you must go outside.']
+    return ['Avoid prolonged outdoor exposure.', 'Move activity indoors where possible.']
+
+
 
     if commute_load <= tolerated_load * 0.8:
         commute_status = 'Safer'
@@ -323,6 +338,8 @@ def render_analysis_overview(df):
     c3.metric('Peak AQI', f"{analysis_df['AQI'].max():.1f}")
 
     if 'date' in analysis_df.columns and analysis_df['date'].notna().any():
+        # Ensure date column is datetime
+        analysis_df['date'] = pd.to_datetime(analysis_df['date'], errors='coerce')
         date_min = analysis_df['date'].min().date()
         date_max = analysis_df['date'].max().date()
         c4.metric('Date Range', f"{date_min} to {date_max}")
@@ -330,6 +347,7 @@ def render_analysis_overview(df):
         c4.metric('Date Range', 'N/A')
 
     top_months = analysis_df[['date', 'AQI']].dropna().copy()
+    top_months['date'] = pd.to_datetime(top_months['date'], errors='coerce')
     available_years = sorted(top_months['date'].dt.year.dropna().astype(int).unique().tolist())
     year_window = list(range(2013, 2027))
     selectable_years = [year for year in year_window if year in available_years]
@@ -379,7 +397,13 @@ def render_analysis_overview(df):
         st.info('No Top AQI month records available for the selected year(s).')
 
     corr_columns = [column for column in ['pm25', 'pm10', 'o3', 'no2', 'so2', 'co', 'AQI'] if column in analysis_df.columns]
-    corr_df = analysis_df[corr_columns].dropna()
+    corr_df = analysis_df[corr_columns].copy()
+    
+    # Convert columns to numeric, replacing non-numeric values with NaN
+    for col in corr_df.columns:
+        corr_df[col] = pd.to_numeric(corr_df[col], errors='coerce')
+    
+    corr_df = corr_df.dropna()
     if len(corr_df) >= 2:
         st.markdown('### Pollutant Correlation Matrix')
         corr_matrix = corr_df.corr().round(2)
@@ -485,6 +509,10 @@ def build_all_cities_top_aqi_months(start_year=2013, end_year=2026, top_n=12):
         if valid_df.empty:
             continue
 
+        # Ensure 'date' column is in datetime format
+        valid_df['date'] = pd.to_datetime(valid_df['date'], errors='coerce')
+        valid_df = valid_df.dropna(subset=['date'])
+        
         valid_df = valid_df[valid_df['date'].dt.year.between(start_year, end_year)]
         if valid_df.empty:
             continue
@@ -599,8 +627,13 @@ def forecast_monthly_series(df, pollutant, months_ahead=6, target_end=None):
     if forecast_df.empty:
         return pd.DataFrame(columns=['date', 'forecast'])
 
+    forecast_df['date'] = pd.to_datetime(forecast_df['date'], errors='coerce')
+    forecast_df = forecast_df.dropna(subset=['date'])
+    if forecast_df.empty:
+        return pd.DataFrame(columns=['date', 'forecast'])
+
     monthly_series = (
-        forecast_df.groupby(pd.Grouper(key='date', freq='MS'))[pollutant]
+        forecast_df.set_index('date').resample('MS')[pollutant]
         .mean()
         .dropna()
         .sort_index()
@@ -733,58 +766,67 @@ def patch_sklearn_pickle_compat(obj):
     return obj
 
 
-# Load the trained Random Forest models and imputers for different cities
-city_models = {
-    "R.K. Puram, Delhi, Delhi, India": {
-        "model": joblib.load(local_file('Delhi_random_forest_model.pkl')),
-        "imputer": joblib.load(local_file('imputer.pkl'))
-    },
-    "Sanjay Nagar, Ghaziabad, India": {
-        "model": joblib.load(local_file('Ghaziabad_random_forest_model.pkl')),
-        "imputer": joblib.load(local_file('imputer.pkl'))
-    },
-    "Knowledge Park - III, Greater Noida, India": {
-        "model": joblib.load(local_file('GNoida_random_forest_model.pkl')),
-        "imputer": joblib.load(local_file('imputer.pkl'))
-    },
-    "Talkatora, Lucknow, India": {
-        "model": joblib.load(local_file('Lucknow_random_forest_model.pkl')),
-        "imputer": joblib.load(local_file('imputer.pkl'))
-    },
-    "Hyderabad": {
-        "model": joblib.load(local_file('Hyderabad_random_forest_model.pkl')),
-        "imputer": joblib.load(local_file('imputer.pkl'))
-    },
-    "Mumbai": {
-        "model": joblib.load(local_file('Mumbai_random_forest_model.pkl')),
-        "imputer": joblib.load(local_file('imputer.pkl'))
-    },
-    "Ahmedabad": {
-        "model": joblib.load(local_file('Ahmedabad_random_forest_model.pkl')),
-        "imputer": joblib.load(local_file('imputer.pkl'))
-    },
-    "Punjab": {
-        "model": joblib.load(local_file('Punjab_random_forest_model.pkl')),
-        "imputer": joblib.load(local_file('imputer.pkl'))
-    },
-    "Gurgaon": {
-        "model": joblib.load(local_file('Gurgaon_random_forest_model.pkl')),
-        "imputer": joblib.load(local_file('imputer.pkl'))
-    },
-    "Chennai": {
-        "model": joblib.load(local_file('Chennai_random_forest_model.pkl')),
-        "imputer": joblib.load(local_file('imputer.pkl'))
-    },
-    "Kerala": {
-        "model": joblib.load(local_file('Kerala_random_forest_model.pkl')),
-        "imputer": joblib.load(local_file('imputer.pkl'))
-    },
-    "Nagaland": {
-        "model": joblib.load(local_file('Nagaland_random_forest_model.pkl')),
-        "imputer": joblib.load(local_file('imputer.pkl'))
-    },
-    # Add more cities as needed
-}
+# Load the trained Random Forest models and imputers for different cities with caching
+@st.cache_resource
+def load_city_models():
+    """Load all city models once and cache in memory for fast predictions."""
+    models = {
+        "R.K. Puram, Delhi, Delhi, India": {
+            "model": joblib.load(local_file('Delhi_random_forest_model.pkl')),
+            "imputer": joblib.load(local_file('imputer.pkl'))
+        },
+        "Sanjay Nagar, Ghaziabad, India": {
+            "model": joblib.load(local_file('Ghaziabad_random_forest_model.pkl')),
+            "imputer": joblib.load(local_file('imputer.pkl'))
+        },
+        "Knowledge Park - III, Greater Noida, India": {
+            "model": joblib.load(local_file('GNoida_random_forest_model.pkl')),
+            "imputer": joblib.load(local_file('imputer.pkl'))
+        },
+        "Talkatora, Lucknow, India": {
+            "model": joblib.load(local_file('Lucknow_random_forest_model.pkl')),
+            "imputer": joblib.load(local_file('imputer.pkl'))
+        },
+        "Hyderabad": {
+            "model": joblib.load(local_file('Hyderabad_random_forest_model.pkl')),
+            "imputer": joblib.load(local_file('imputer.pkl'))
+        },
+        "Mumbai": {
+            "model": joblib.load(local_file('Mumbai_random_forest_model.pkl')),
+            "imputer": joblib.load(local_file('imputer.pkl'))
+        },
+        "Ahmedabad": {
+            "model": joblib.load(local_file('Ahmedabad_random_forest_model.pkl')),
+            "imputer": joblib.load(local_file('imputer.pkl'))
+        },
+        "Punjab": {
+            "model": joblib.load(local_file('Punjab_random_forest_model.pkl')),
+            "imputer": joblib.load(local_file('imputer.pkl'))
+        },
+        "Gurgaon": {
+            "model": joblib.load(local_file('Gurgaon_random_forest_model.pkl')),
+            "imputer": joblib.load(local_file('imputer.pkl'))
+        },
+        "Chennai": {
+            "model": joblib.load(local_file('Chennai_random_forest_model.pkl')),
+            "imputer": joblib.load(local_file('imputer.pkl'))
+        },
+        "Kerala": {
+            "model": joblib.load(local_file('Kerala_random_forest_model.pkl')),
+            "imputer": joblib.load(local_file('imputer.pkl'))
+        },
+        "Nagaland": {
+            "model": joblib.load(local_file('Nagaland_random_forest_model.pkl')),
+            "imputer": joblib.load(local_file('imputer.pkl'))
+        },
+    }
+    # Apply sklearn compatibility patches
+    for info in models.values():
+        patch_sklearn_pickle_compat(info.get("model"))
+        patch_sklearn_pickle_compat(info.get("imputer"))
+    return models
+
+city_models = load_city_models()
 
 # City display name -> API query name
 city_api_map = {
@@ -832,13 +874,15 @@ city_bg_map = {
     "Nagaland": 'nagaland.jpg',
 }
 
-# Compatibility fix for models pickled with older scikit-learn releases.
-for info in city_models.values():
-    patch_sklearn_pickle_compat(info.get("model"))
-    patch_sklearn_pickle_compat(info.get("imputer"))
+# API token (WAQI/AQICN) loaded from environment when provided
+api_key = config.get_waqi_token()
 
-# Replace this with your OpenAQ API key
-api_key = "9122142749f2d354a43af188bc4486a59f678eed"
+# Cache background image loading for faster rendering
+@st.cache_data
+def load_background_image(image_file):
+    """Load and encode background image once for caching."""
+    with open(image_file, "rb") as f:
+        return base64.b64encode(f.read()).decode()
 
 # Create session state variables
 if "selected_city" not in st.session_state:
@@ -855,8 +899,7 @@ page = st.sidebar.radio("Select Page", ["Home", "AQI Prediction", "Health Predic
 
 if page == "Home":
     def add_bg_from_local(image_file):
-        with open(image_file, "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read())
+        encoded_string = load_background_image(image_file)
         css = """
         <style>
         .stApp {
@@ -965,7 +1008,7 @@ if page == "Home":
         </style>
         """
         st.markdown(
-            css.replace("__ENCODED_BG__", encoded_string.decode()),
+            css.replace("__ENCODED_BG__", encoded_string),
             unsafe_allow_html=True
         )
 
@@ -1142,13 +1185,12 @@ elif page == "AQI Prediction":
 
     # Update the background image using CSS
     def add_bg_from_local(image_file):
-        with open(image_file, "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read())
+        encoded_string = load_background_image(image_file)
         st.markdown(
         f"""
         <style>
         .stApp {{
-            background-image: url(data:image/{"jpg"};base64,{encoded_string.decode()});
+            background-image: url(data:image/{"jpg"};base64,{encoded_string});
             background-repeat: no-repeat;
             background-size: 100% 100%;
         }}
@@ -1170,96 +1212,96 @@ elif page == "AQI Prediction":
     st.session_state.selected_city = selected_city
 
     if st.button("Predict AQI"):
-        # Fetch air quality data using OpenAQ API
-        city_query = city_api_map.get(selected_city, selected_city)
-        url = f"https://api.waqi.info/feed/{city_query}/?token={api_key}"
-        response = requests.get(url)
-        json_data = response.json()
+        # Build candidate query names derived from the selected city
+        city_query_base = city_api_map.get(selected_city, selected_city)
+        candidates = []
+        if city_query_base:
+            candidates.append(city_query_base)
+            # short name before first comma
+            if ',' in city_query_base:
+                candidates.append(city_query_base.split(',')[0].strip())
+            # normalized name (remove commas)
+            candidates.append(city_query_base.replace(',', ' ').strip())
 
-        if json_data.get('status') == 'ok' and isinstance(json_data.get('data'), dict):
-            data = json_data['data']
-            aqi = data.get('aqi', 'N/A')
+        # Add a filename-derived candidate if mapped to a local CSV
+        city_file = city_data_map.get(selected_city)
+        if city_file:
+            file_base = Path(city_file).stem
+            # replace dashes/underscores with spaces
+            file_candidate = file_base.replace('-', ' ').replace('_', ' ').strip()
+            candidates.append(file_candidate)
 
-            # Store AQI in session state
-            st.session_state.aqi = aqi
+        # Deduplicate while preserving order
+        seen = set()
+        candidates = [c for c in candidates if c and not (c in seen or seen.add(c))]
 
-            pm25 = data['iaqi'].get('pm25', {}).get('v', 'N/A')
-            pm10 = data['iaqi'].get('pm10', {}).get('v', 'N/A')
-            o3 = data['iaqi'].get('o3', {}).get('v', 'N/A')
-            no2 = data['iaqi'].get('no2', {}).get('v', 'N/A')
-            so2 = data['iaqi'].get('so2', {}).get('v', 'N/A')
-            co = data['iaqi'].get('co', {}).get('v', 'N/A')
+        pollutant_values = None
+        # Try candidates in order: exact OpenAQ city query, nearest-by-geocode, WAQI fallback
+        for cand in candidates:
+            pollutant_values = realtime_api.fetch_latest_by_city(cand)
+            if pollutant_values:
+                break
+            pollutant_values = realtime_api.fetch_nearest_by_city(cand)
+            if pollutant_values:
+                break
 
-            # Check for 'N/A' values
-            if 'N/A' in [pm25, pm10, o3, no2, so2, co]:
-                st.error("Some air quality parameters are not available.")
-            else:
-                pollutant_values = {
-                    'pm25': float(pm25),
-                    'pm10': float(pm10),
-                    'o3': float(o3),
-                    'no2': float(no2),
-                    'so2': float(so2),
-                    'co': float(co),
-                }
+        # If still nothing, try WAQI using original base name and token
+        if not pollutant_values:
+            waqi_token = config.get_waqi_token()
+            if waqi_token:
+                pollutant_values = realtime_api.fetch_from_waqi(city_query_base, waqi_token)
 
-                if selected_city in city_models:
-                    # Create a dictionary with the retrieved air quality parameters
-                    input_data = {key: [value] for key, value in pollutant_values.items()}
+        if not pollutant_values:
+            st.error('No live pollutant data available from OpenAQ or WAQI for this city.')
+            pollutant_values = {}
 
-                    # Convert the input data to a DataFrame
-                    input_df = pd.DataFrame(input_data)
+        if pollutant_values:
+            # Ensure numeric values and fill missing as None
+            pollutant_values = {k: (float(v) if v is not None else None) for k, v in pollutant_values.items()}
 
-                    # Impute missing values with the mean using the loaded imputer
-                    imputer = city_models[selected_city]["imputer"]
-                    input_imputed = imputer.transform(input_df)
+            # Estimate AQI using local model if available, otherwise fallback to PM2.5-based estimate
+            if selected_city in city_models:
+                input_data = {key: [pollutant_values.get(key, None) or 0.0] for key in ['pm25', 'pm10', 'o3', 'no2', 'so2', 'co']}
+                input_df = pd.DataFrame(input_data)
+                imputer = city_models[selected_city]["imputer"]
+                input_imputed = imputer.transform(input_df)
+                rf_model = city_models[selected_city]["model"]
+                rf_aqi = rf_model.predict(input_imputed)
+                display_aqi = float(rf_aqi[0])
+                st.session_state.aqi = display_aqi
 
-                    # Predict AQI using the Random Forest model
-                    rf_model = city_models[selected_city]["model"]
-                    rf_aqi = rf_model.predict(input_imputed)
-                    display_aqi = float(rf_aqi[0])
+                st.write(f"The AQI in {selected_city} is: {display_aqi:.2f}")
+                status_text, color = get_aqi_status(display_aqi)
+                styled_message = f'<p style="font-size: larger;">The air quality is <span style="color:{color}; font-size: larger;"><strong>{status_text.upper()}.</strong></span></p>'
+                st.markdown(styled_message, unsafe_allow_html=True)
+                render_alert_banner(display_aqi)
 
-                    st.write(f"The AQI in {selected_city} is: {display_aqi:.2f}")
+                status_col, source_col, avg_col = st.columns(3)
+                status_col.metric('AQI Band', status_text)
+                source_col.metric('Prediction Source', 'Local Model')
 
-                    # Determine the air quality category and set color
-                    status_text, color = get_aqi_status(display_aqi)
-                    quality_message = f"<strong>{status_text.upper()}.</strong>"
-
-                    # Combine the message and quality_message into a single string
-                    styled_message = f'<p style="font-size: larger;">The air quality is <span style="color:{color}; font-size: larger;">{quality_message}</span></p>'
-
-                    st.markdown(styled_message, unsafe_allow_html=True)
-                    render_alert_banner(display_aqi)
-
-                    status_col, source_col, avg_col = st.columns(3)
-                    status_col.metric('AQI Band', status_text)
-                    source_col.metric('Prediction Source', 'Local Model')
-
-                    history_df = load_city_history(selected_city)
-                    if history_df is not None and 'AQI' in history_df.columns and history_df['AQI'].notna().any():
-                        historical_avg = float(history_df['AQI'].mean())
-                        avg_col.metric('Vs Historical Mean', f"{display_aqi - historical_avg:+.1f}")
-
-                        latest_row = history_df.sort_values('date').dropna(subset=['AQI']).tail(1)
-                        if not latest_row.empty:
-                            st.markdown('### Historical Context')
-                            h1, h2, h3 = st.columns(3)
-                            h1.metric('Historical Mean AQI', f"{historical_avg:.1f}")
-                            h2.metric('Historical Peak AQI', f"{history_df['AQI'].max():.1f}")
-                            h3.metric('Last Dataset AQI', f"{latest_row['AQI'].iloc[0]:.1f}")
-                    else:
-                        avg_col.metric('Vs Historical Mean', 'N/A')
-
-                    st.session_state.latest_report = build_prediction_report(
-                        selected_city,
-                        display_aqi,
-                        status_text,
-                        'Local Model',
-                        pollutant_values,
-                    )
+                history_df = load_city_history(selected_city)
+                if history_df is not None and 'AQI' in history_df.columns and history_df['AQI'].notna().any():
+                    historical_avg = float(history_df['AQI'].mean())
+                    avg_col.metric('Vs Historical Mean', f"{display_aqi - historical_avg:+.1f}")
                 else:
-                    display_aqi = float(aqi)
-                    st.write(f"Live AQI in {selected_city}: {display_aqi:.2f}")
+                    avg_col.metric('Vs Historical Mean', 'N/A')
+
+                st.session_state.latest_report = build_prediction_report(
+                    selected_city,
+                    display_aqi,
+                    status_text,
+                    'Local Model',
+                    pollutant_values,
+                )
+            else:
+                # Fallback: estimate AQI from PM2.5 if available
+                display_aqi = realtime_api.compute_aqi_from_pm25(pollutant_values.get('pm25'))
+                if display_aqi is None:
+                    st.error('Unable to estimate AQI: PM2.5 not available.')
+                else:
+                    st.session_state.aqi = display_aqi
+                    st.write(f"Estimated AQI in {selected_city}: {display_aqi:.2f} (from PM2.5)")
                     st.info(NO_LOCAL_MODEL_MESSAGE)
                     status_text, color = get_aqi_status(display_aqi)
                     st.markdown(
@@ -1280,60 +1322,180 @@ elif page == "AQI Prediction":
                         selected_city,
                         display_aqi,
                         status_text,
-                        'WAQI Live',
+                        'OpenAQ Live',
                         pollutant_values,
                     )
 
-                st.markdown('### Pollutant Snapshot')
-                p1, p2, p3 = st.columns(3)
-                p4, p5, p6 = st.columns(3)
-                p1.metric('PM2.5', f"{pollutant_values['pm25']:.2f}")
-                p2.metric('PM10', f"{pollutant_values['pm10']:.2f}")
-                p3.metric('Ozone', f"{pollutant_values['o3']:.2f}")
-                p4.metric('Nitrogen Dioxide', f"{pollutant_values['no2']:.2f}")
-                p5.metric('Sulfur Dioxide', f"{pollutant_values['so2']:.2f}")
-                p6.metric('Carbon Monoxide', f"{pollutant_values['co']:.2f}")
+            # Pollutant snapshot display
+            st.markdown('### Pollutant Snapshot')
+            p1, p2, p3 = st.columns(3)
+            p4, p5, p6 = st.columns(3)
+            p1.metric('PM2.5', f"{(pollutant_values.get('pm25') or 0.0):.2f}")
+            p2.metric('PM10', f"{(pollutant_values.get('pm10') or 0.0):.2f}")
+            p3.metric('Ozone', f"{(pollutant_values.get('o3') or 0.0):.2f}")
+            p4.metric('Nitrogen Dioxide', f"{(pollutant_values.get('no2') or 0.0):.2f}")
+            p5.metric('Sulfur Dioxide', f"{(pollutant_values.get('so2') or 0.0):.2f}")
+            p6.metric('Carbon Monoxide', f"{(pollutant_values.get('co') or 0.0):.2f}")
 
-                snapshot_df = build_snapshot_dataframe(
-                    selected_city,
-                    display_aqi,
-                    pollutant_values,
-                    'Local Model' if selected_city in city_models else 'WAQI Live',
-                )
+            snapshot_df = build_snapshot_dataframe(
+                selected_city,
+                display_aqi,
+                pollutant_values,
+                'Local Model' if selected_city in city_models else 'OpenAQ Live',
+            )
+            st.download_button(
+                'Download AQI Snapshot',
+                data=snapshot_df.to_csv(index=False),
+                file_name='aqi_snapshot.csv',
+                mime='text/csv',
+            )
+            # Save snapshot to results/ when user requests
+            if st.button('Save AQI Snapshot to results'):
+                results_dir = local_file('results')
+                try:
+                    if not results_dir.exists():
+                        results_dir.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    # fallback to current directory
+                    results_dir = Path(__file__).resolve().with_name('.')
+
+                safe_name = selected_city.replace(',', '').replace(' ', '_').replace('.', '')
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                fname = f"{safe_name}_aqi_snapshot_{ts}.csv"
+                out_path = results_dir / fname
+                try:
+                    snapshot_df.to_csv(out_path, index=False)
+                    st.success(f"Saved snapshot to results/{fname}")
+                except Exception as e:
+                    st.error(f"Failed to save snapshot: {e}")
+            if st.session_state.latest_report is not None:
                 st.download_button(
-                    'Download AQI Snapshot',
-                    data=snapshot_df.to_csv(index=False),
-                    file_name='aqi_snapshot.csv',
-                    mime='text/csv',
+                    'Download Prediction Report (JSON)',
+                    data=json.dumps(st.session_state.latest_report, indent=2),
+                    file_name='prediction_report.json',
+                    mime='application/json',
                 )
-                if st.session_state.latest_report is not None:
-                    st.download_button(
-                        'Download Prediction Report (JSON)',
-                        data=json.dumps(st.session_state.latest_report, indent=2),
-                        file_name='prediction_report.json',
-                        mime='application/json',
-                    )
 
-                render_forecast_panel(selected_city, pollutant='AQI', months_ahead=6)
+            render_forecast_panel(selected_city, pollutant='AQI', months_ahead=6)
+
+    # --- Realtime AQI for currently selected city ---
+    st.markdown('---')
+    st.markdown('### Realtime AQI (for selected city)')
+    tick_selected = st.checkbox('Show realtime AQI for the selected city')
+    if tick_selected:
+        city = selected_city
+        st.info(f'Fetching realtime AQI for {city}...')
+        base = city_api_map.get(city, city)
+        candidates = [base]
+        if ',' in base:
+            candidates.append(base.split(',')[0].strip())
+        candidates.append(base.replace(',', ' ').strip())
+        city_file = city_data_map.get(city)
+        if city_file:
+            candidates.append(Path(city_file).stem.replace('-', ' ').replace('_', ' ').strip())
+        seen = set(); candidates = [c for c in candidates if c and not (c in seen or seen.add(c))]
+
+        pollutant_values = None
+        source_label = 'NO DATA'
+        for cand in candidates:
+            pollutant_values = realtime_api.fetch_latest_by_city(cand)
+            if pollutant_values:
+                source_label = 'OpenAQ'
+                break
+            pollutant_values = realtime_api.fetch_nearest_by_city(cand)
+            if pollutant_values:
+                source_label = 'OpenAQ (nearest)'
+                break
+
+        if not pollutant_values:
+            waqi_token = config.get_waqi_token()
+            if waqi_token:
+                pollutant_values = realtime_api.fetch_from_waqi(base, waqi_token)
+                if pollutant_values:
+                    source_label = 'WAQI'
+
+        if not pollutant_values:
+            st.error(f'No realtime pollutant data available for {city}.')
         else:
-            error_message = json_data.get('data')
-            if isinstance(error_message, dict):
-                error_message = error_message.get('message', 'Unable to fetch AQI data for this city.')
-            elif not isinstance(error_message, str):
-                error_message = 'Unable to fetch AQI data for this city.'
-            st.error(error_message)
+            try:
+                pollutant_values = {k: (float(v) if v is not None else None) for k, v in pollutant_values.items()}
+            except Exception:
+                pass
+
+            if city in city_models:
+                input_data = {key: [pollutant_values.get(key, None) or 0.0] for key in ['pm25', 'pm10', 'o3', 'no2', 'so2', 'co']}
+                input_df = pd.DataFrame(input_data)
+                imputer = city_models[city]['imputer']
+                input_imputed = imputer.transform(input_df)
+                rf_model = city_models[city]['model']
+                try:
+                    display_aqi = float(rf_model.predict(input_imputed)[0])
+                except Exception:
+                    display_aqi = realtime_api.compute_aqi_from_pm25(pollutant_values.get('pm25'))
+            else:
+                display_aqi = realtime_api.compute_aqi_from_pm25(pollutant_values.get('pm25'))
+
+            snapshot_df = build_snapshot_dataframe(city, display_aqi, pollutant_values, source_label)
+            st.markdown('#### Realtime Snapshot')
+
+            # AQI status and alert banner
+            if display_aqi is not None:
+                try:
+                    status_text, status_color = get_aqi_status(float(display_aqi))
+                except Exception:
+                    status_text, status_color = ('N/A', '#000000')
+                st.metric('AQI', f"{display_aqi:.1f}", status_text)
+                render_alert_banner(display_aqi)
+
+                # Health guidance
+                actions = get_health_actions(float(display_aqi))
+                st.markdown('**Recommended actions:**')
+                for act in actions:
+                    st.write(f'- {act}')
+
+            st.dataframe(snapshot_df, use_container_width=True)
+            st.download_button('Download AQI Snapshot (selected city)', data=snapshot_df.to_csv(index=False), file_name=f'{city}_aqi_snapshot.csv', mime='text/csv')
+
+            # Pollutant bar chart
+            try:
+                poll_vals = {k: snapshot_df.at[0, k] for k in ['pm25', 'pm10', 'o3', 'no2', 'so2', 'co'] if k in snapshot_df.columns}
+                if any(v is not None for v in poll_vals.values()):
+                    fig, ax = plt.subplots(figsize=(8, 3.4))
+                    pd.Series(poll_vals).plot(kind='bar', color='#2a9d8f', ax=ax)
+                    ax.set_ylabel('Concentration')
+                    ax.set_title(f'Pollutant Snapshot — {city}')
+                    ax.grid(axis='y', alpha=0.25)
+                    fig.tight_layout()
+                    st.pyplot(fig)
+            except Exception:
+                pass
+            if st.button('Save AQI Snapshot to results (selected city)'):
+                results_dir = local_file('results')
+                try:
+                    if not results_dir.exists():
+                        results_dir.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    results_dir = Path(__file__).resolve().with_name('.')
+                safe_name = city.replace(',', '').replace(' ', '_').replace('.', '')
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                fname = f"{safe_name}_aqi_snapshot_{ts}.csv"
+                out_path = results_dir / fname
+                try:
+                    snapshot_df.to_csv(out_path, index=False)
+                    st.success(f"Saved snapshot to results/{fname}")
+                except Exception as e:
+                    st.error(f"Failed to save snapshot: {e}")
 
 elif page == "Health Prediction":
     st.title("Health Prediction")
 
     def add_bg_from_local(image_file):
-        with open(image_file, "rb") as image_file:
-            encoded_string = base64.b64encode(image_file.read())
+        encoded_string = load_background_image(image_file)
         st.markdown(
             f"""
         <style>
         .stApp {{
-            background-image: url(data:image/{"jpg"};base64,{encoded_string.decode()});
+            background-image: url(data:image/{"jpg"};base64,{encoded_string});
             background-size: cover
         }}
         </style>
@@ -1596,8 +1758,7 @@ if page == "Analysis":
     st.write(f"Selected City: {st.session_state.selected_city}")
 
     def add_bg_from_local(image_file):
-        with open(image_file, "rb") as image_handle:
-            encoded_string = base64.b64encode(image_handle.read())
+        encoded_string = load_background_image(image_file)
         st.markdown(
             f"""
         <style>
@@ -1606,7 +1767,7 @@ if page == "Analysis":
                 radial-gradient(circle at 12% 20%, rgba(13, 148, 136, 0.28), rgba(13, 148, 136, 0) 36%),
                 radial-gradient(circle at 88% 18%, rgba(245, 158, 11, 0.25), rgba(245, 158, 11, 0) 34%),
                 linear-gradient(160deg, rgba(10, 20, 38, 0.88), rgba(6, 13, 24, 0.78)),
-                url(data:image/{{"jpg"}};base64,{encoded_string.decode()});
+                url(data:image/{{"jpg"}};base64,{encoded_string});
             background-size: cover;
             background-position: center;
             background-attachment: fixed;
