@@ -1,49 +1,31 @@
-"""Configuration helpers for API keys and environment overrides.
-
-Reads tokens from environment variables or .env file. Defaults to None when not set.
 """
+Configuration loader for Air-Pulse
+Loads environment variables from .env file
+"""
+
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 
+# Load .env file from project root
+env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(env_path)
 
-def _load_dotenv(dotenv_path=None):
-    """Lightweight .env loader that sets values if not present in env already."""
-    path = Path(dotenv_path) if dotenv_path else Path(__file__).resolve().parent / '.env'
-    if not path.exists():
-        return {}
+# Get WAQI token from environment
+WAQI_TOKEN = os.getenv("WAQI_TOKEN", "")
 
-    values = {}
-    try:
-        for line in path.read_text(encoding='utf-8').splitlines():
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            if '=' not in line:
-                continue
-            k, v = line.split('=', 1)
-            k = k.strip()
-            v = v.strip().strip('"').strip("'")
-            if k and v is not None:
-                values[k] = v
-                # Do not overwrite existing environment variables
-                if os.environ.get(k) is None:
-                    os.environ[k] = v
-    except Exception:
-        return {}
-    return values
-
-
-# Attempt to load project .env (non-destructive)
-_load_dotenv()
-
-# WAQI / AQICN token (kept for backward compatibility)
-WAQI_TOKEN = os.environ.get('WAQI_TOKEN') or os.environ.get('AQICN_TOKEN')
-
-# Placeholder if an OpenAQ token is ever needed in the future
-OPENAQ_TOKEN = os.environ.get('OPENAQ_TOKEN')
+# API endpoints
+OPENAQ_BASE_URL = "https://api.openaq.org/v2"
+WAQI_BASE_URL = "https://api.waqi.info"
 
 def get_waqi_token():
+    """Get WAQI API token"""
     return WAQI_TOKEN
 
-def get_openaq_token():
-    return OPENAQ_TOKEN
+def get_openaq_url():
+    """Get OpenAQ base URL"""
+    return OPENAQ_BASE_URL
+
+def get_waqi_url():
+    """Get WAQI base URL"""
+    return WAQI_BASE_URL

@@ -1,221 +1,301 @@
 """
-Simple OpenAQ client for fetching latest pollutant measurements by city.
-
-Provides a helper to retrieve common pollutant values (pm25, pm10, o3, no2, so2, co)
-and returns averaged values across returned locations when multiple measurements
-are available.
+Real-time Air Quality API client for Air-Pulse
+Supports OpenAQ and WAQI with automatic fallback
 """
+
 import requests
-from collections import defaultdict
+import numpy as np
+from typing import Dict, Optional, List
+import config
 
-OPENAQ_BASE = "https://api.openaq.org/v2/latest"
-OPENAQ_MEASUREMENTS = "https://api.openaq.org/v2/measurements"
+def compute_aqi_from_pm25(pm25: float) -> int:
+    """
+    Compute AQI from PM2.5 using US EPA breakpoints
+    
+    Args:
+        pm25: PM2.5 concentration in µg/m³
+        
+    Returns:
+        AQI value
+    """
+    if pm25 <= 12.0:
+        return int((pm25 / 12.0) * 50)
+    elif pm25 <= 35.4:
+        return int(((pm25 - 12.1) / (35.4 - 12.1)) * 50 + 50)
+    elif pm25 <= 55.4:
+        return int(((pm25 - 35.5) / (55.4 - 35.5)) * 50 + 100)
+    elif pm25 <= 150.4:
+        return int(((pm25 - 55.5) / (150.4 - 55.5)) * 50 + 150)
+    elif pm25 <= 250.4:
+        return int(((pm25 - 150.5) / (250.4 - 150.5)) * 50 + 200)
+    else:
+        return int(((pm25 - 250.5) / 500) * 99 + 250)
 
-WAQI_BASE = "https://api.waqi.info/feed"
 
-NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
+def _normalize_pollutants(raw: Dict) -> Dict:
+    """Normalize various pollutant key formats to the lowercase keys used
+    across the app: 'pm25','pm10','o3','no2','so2','co'.
+    """
+    if not raw:
+        return {}
 
+    mapping = {}
+    for k, v in raw.items():
+        if v is None:
+            continue
+        key = str(k).lower()
+        # Normalize common variants
+        if key in ('pm2.5', 'pm25', 'pm_2_5'):
+            mapping['pm25'] = float(v)
+        elif key in ('pm10', 'pm_10'):
+            mapping['pm10'] = float(v)
+        elif key in ('o3', 'o_3'):
+            mapping['o3'] = float(v)
+        elif key in ('no2', 'nox', 'no_2'):
+            mapping['no2'] = float(v)
+        elif key in ('so2', 'so_2'):
+            mapping['so2'] = float(v)
+        elif key in ('co',):
+            mapping['co'] = float(v)
+        else:
+            # ignore unknown keys
+            continue
 
-def geocode_city(city_name, timeout=10):
-    """Resolve a city name to (lat, lon) using Nominatim. Returns (lat, lon) or None."""
+    return mapping
+
+def fetch_from_openaq_direct(city: str, country: str = "India") -> Optional[Dict]:
+    """
+    Fetch air quality data directly from OpenAQ by city name
+    
+    Args:
+        city: City name
+        country: Country name
+        
+    Returns:
+        Dict with pollutant data or None if not found
+    """
     try:
+        url = f"{config.get_openaq_url()}/latest"
         params = {
-            'q': city_name,
-            'format': 'json',
-            'limit': 1,
+            "city": city,
+            "country": country,
+            "limit": 1
         }
-        resp = requests.get(NOMINATIM_SEARCH, params=params, timeout=timeout, headers={'User-Agent': 'air-pulse/1.0'})
-        resp.raise_for_status()
-        if not resp.text:
-            return None
-        data = resp.json()
-        if not data:
-            return None
-        lat = float(data[0]['lat'])
-        lon = float(data[0]['lon'])
-        return lat, lon
-    except Exception:
+        response = requests.get(url, params=params, timeout=5)
+        response.raise_for_status()
+        
+        data = response.json()
+        if data.get("results") and len(data["results"]) > 0:
+            result = data["results"][0]
+            pollutants = {}
+
+            for measurement in result.get("measurements", []):
+                parameter = measurement.get("parameter", "")
+                value = measurement.get("value")
+                if value is not None:
+                    pollutants[str(parameter)] = value
+
+            if pollutants:
+                return _normalize_pollutants(pollutants)
+        return None
+    except Exception as e:
+        print(f"OpenAQ direct fetch error: {e}")
         return None
 
-
-def fetch_nearest_by_city(city_name, radius_m=50000, limit=100, timeout=10):
-    """Geocode the city and query OpenAQ latest measurements near those coordinates.
-
-    Returns same mapping as `fetch_latest_by_city` or None.
+def fetch_nearest_by_city(city: str, radius_m: int = 100000) -> Optional[Dict]:
     """
-    coords = geocode_city(city_name, timeout=timeout)
-    if coords is None:
-        return None
-    lat, lon = coords
-    params = {
-        'coordinates': f"{lat},{lon}",
-        'radius': radius_m,
-        'limit': limit,
-    }
+    Find nearest OpenAQ stations and fetch their data
+    
+    Args:
+        city: City name
+        radius_m: Search radius in meters
+        
+    Returns:
+        Dict with aggregated pollutant data or None
+    """
     try:
-        # Use measurements endpoint to get parameter/value pairs near coordinates
-        resp = requests.get(OPENAQ_MEASUREMENTS, params=params, timeout=timeout)
-        resp.raise_for_status()
-        if not resp.text:
-            return None
-        data = resp.json()
-        results = data.get('results', [])
-        if not results:
-            return None
-
-        # Convert measurements list into a results-like structure for aggregation
-        pseudo_results = []
-        for r in results:
-            pseudo_results.append({'measurements': [{'parameter': r.get('parameter'), 'value': r.get('value')}]})
-
-        agg = _aggregate_results(pseudo_results)
-        mapped = {
-            'pm25': agg.get('pm25') or agg.get('pm2.5'),
-            'pm10': agg.get('pm10'),
-            'o3': agg.get('o3'),
-            'no2': agg.get('no2'),
-            'so2': agg.get('so2'),
-            'co': agg.get('co'),
+        # Approximate geocoding for major Indian cities
+        city_coords = {
+            "delhi": (28.7041, 77.1025),
+            "mumbai": (19.0760, 72.8777),
+            "bangalore": (12.9716, 77.5946),
+            "hyderabad": (17.3850, 78.4867),
+            "pune": (18.5204, 73.8567),
+            "ahmedabad": (23.0225, 72.5714),
+            "gurgaon": (28.4595, 77.0266),
+            "noida": (28.5355, 77.3910),
+            "ghaziabad": (28.6692, 77.4538),
+            "lucknow": (26.8467, 80.9462),
+            "Chennai": (13.0827, 80.2707),
+            "kerala": (10.8505, 76.2711),
+            "nagaland": (26.1584, 94.5624),
         }
-        if not any(v is not None for v in mapped.values()):
+        
+        city_lower = city.lower()
+        coords = city_coords.get(city_lower)
+        
+        if not coords:
             return None
-        return mapped
-    except Exception:
-        return None
-
-
-def _aggregate_results(results):
-    # Aggregate values by parameter name and compute mean
-    sums = defaultdict(float)
-    counts = defaultdict(int)
-
-    for item in results:
-        measurements = item.get('measurements') or item.get('parameters') or []
-        for m in measurements:
-            param = m.get('parameter') or m.get('parameter')
-            # OpenAQ v2 uses 'value'
-            value = m.get('value') if 'value' in m else m.get('lastValue')
-            try:
-                val = float(value)
-            except Exception:
-                continue
-            sums[param.lower()] += val
-            counts[param.lower()] += 1
-
-    aggregated = {}
-    for param, total in sums.items():
-        aggregated[param] = total / max(1, counts[param])
-
-    return aggregated
-
-
-def fetch_latest_by_city(city_name, limit=100, timeout=10):
-    """Fetch latest measurements for a given city name from OpenAQ.
-
-    Returns a dict with keys: pm25, pm10, o3, no2, so2, co (values are floats or None).
-    """
-    params = {
-        'city': city_name,
-        'limit': limit,
-    }
-    try:
-        resp = requests.get(OPENAQ_BASE, params=params, timeout=timeout)
-        resp.raise_for_status()
-        if not resp.text:
-            return None
-        data = resp.json()
-        results = data.get('results', [])
-        if not results:
-            return None
-
-        agg = _aggregate_results(results)
-
-        # Map common parameter names to expected keys
-        mapped = {
-            'pm25': agg.get('pm25') or agg.get('pm2.5'),
-            'pm10': agg.get('pm10'),
-            'o3': agg.get('o3'),
-            'no2': agg.get('no2'),
-            'so2': agg.get('so2'),
-            'co': agg.get('co'),
+        
+        lat, lon = coords
+        
+        # Query nearest stations
+        url = f"{config.get_openaq_url()}/locations"
+        params = {
+            "coordinates": f"{lat},{lon}",
+            "nearest": True,
+            "limit": 5
         }
+        
+        response = requests.get(url, params=params, timeout=5)
+        response.raise_for_status()
+        
+        data = response.json()
+        if data.get("results"):
+            location_id = data["results"][0].get("id")
 
-        # If nothing found, return None
-        if not any(v is not None for v in mapped.values()):
-            return None
+            # Get latest measurements from this location
+            url = f"{config.get_openaq_url()}/latest"
+            params = {"location_id": location_id}
+            response = requests.get(url, params=params, timeout=5)
+            response.raise_for_status()
 
-        return mapped
-    except Exception:
+            latest_data = response.json()
+            if latest_data.get("results"):
+                result = latest_data["results"][0]
+                pollutants = {}
+
+                for measurement in result.get("measurements", []):
+                    parameter = measurement.get("parameter", "")
+                    value = measurement.get("value")
+                    if value is not None:
+                        pollutants[str(parameter)] = value
+
+                if pollutants:
+                    return _normalize_pollutants(pollutants)
+
+        return None
+    except Exception as e:
+        print(f"OpenAQ nearest fetch error: {e}")
         return None
 
-
-def compute_aqi_from_pm25(pm25_value):
-    """Estimate US-EPA AQI from PM2.5 concentration using standard breakpoints.
-
-    Returns estimated AQI as float. If pm25_value is None, returns None.
+def fetch_from_waqi(city: str, token: Optional[str] = None) -> Optional[Dict]:
     """
-    if pm25_value is None:
-        return None
-    try:
-        c = float(pm25_value)
-    except Exception:
-        return None
-
-    # Breakpoints for PM2.5 (µg/m3) - US EPA
-    breakpoints = [
-        (0.0, 12.0, 0, 50),
-        (12.1, 35.4, 51, 100),
-        (35.5, 55.4, 101, 150),
-        (55.5, 150.4, 151, 200),
-        (150.5, 250.4, 201, 300),
-        (250.5, 350.4, 301, 400),
-        (350.5, 500.4, 401, 500),
-    ]
-
-    for (c_low, c_high, i_low, i_high) in breakpoints:
-        if c_low <= c <= c_high:
-            aqi = ((i_high - i_low) / (c_high - c_low)) * (c - c_low) + i_low
-            return round(aqi, 1)
-
-    # If above known range
-    return 500.0
-
-
-def fetch_from_waqi(city_name, token, timeout=10):
-    """Fetch pollutant snapshot from WAQI (AQICN) API as a fallback.
-
-    Returns a dict with keys similar to fetch_latest_by_city (pm25, pm10, o3, no2, so2, co)
-    and may include 'aqi' when provided by the API. Returns None on failure.
+    Fetch air quality data from WAQI API
+    
+    Args:
+        city: City name
+        token: WAQI API token (uses config if not provided)
+        
+    Returns:
+        Dict with pollutant data or None if not found
     """
-    if not token:
-        return None
     try:
-        url = f"{WAQI_BASE}/{city_name}/?token={token}"
-        resp = requests.get(url, timeout=timeout)
-        resp.raise_for_status()
-        if not resp.text:
+        if not token:
+            token = config.get_waqi_token()
+        
+        if not token:
             return None
-        j = resp.json()
-        if j.get('status') != 'ok' or not isinstance(j.get('data'), dict):
-            return None
+        
+        url = f"{config.get_waqi_url()}/feed/{city}"
+        params = {"token": token}
+        
+        response = requests.get(url, params=params, timeout=5)
+        response.raise_for_status()
+        
+        data = response.json()
+        if data.get("status") == "ok" and data.get("data"):
+            pollutants = {}
+            data_obj = data["data"]
 
-        data = j['data']
-        aqi_val = data.get('aqi')
-        iaqi = data.get('iaqi', {})
+            # Extract pollutants
+            pollutant_map = {
+                "pm25": "PM2.5",
+                "pm10": "PM10",
+                "o3": "O3",
+                "no2": "NO2",
+                "so2": "SO2",
+                "co": "CO"
+            }
 
-        mapped = {
-            'pm25': (iaqi.get('pm25') or {}).get('v'),
-            'pm10': (iaqi.get('pm10') or {}).get('v'),
-            'o3': (iaqi.get('o3') or {}).get('v'),
-            'no2': (iaqi.get('no2') or {}).get('v'),
-            'so2': (iaqi.get('so2') or {}).get('v'),
-            'co': (iaqi.get('co') or {}).get('v'),
-        }
-        # include reported AQI when present
-        if aqi_val is not None:
-            mapped['aqi'] = aqi_val
+            # WAQI sometimes nests pollutant values differently
+            iaqi = data_obj.get("iaqi") or {}
+            for key, param_name in pollutant_map.items():
+                # Prefer iaqi entries
+                if key in iaqi and isinstance(iaqi[key], dict) and iaqi[key].get("v") is not None:
+                    pollutants[param_name] = iaqi[key]["v"]
+                elif key in data_obj and isinstance(data_obj[key], dict) and data_obj[key].get("v") is not None:
+                    pollutants[param_name] = data_obj[key]["v"]
 
-        return mapped
-    except Exception:
+            # Fallback: if top-level keys like 'pm25' exist with numbers
+            for key, param_name in pollutant_map.items():
+                if param_name not in pollutants and key in data_obj and isinstance(data_obj[key], (int, float)):
+                    pollutants[param_name] = data_obj[key]
+
+            if pollutants:
+                return _normalize_pollutants(pollutants)
+
+        return None
+    except Exception as e:
+        print(f"WAQI fetch error: {e}")
         return None
 
+def fetch_aqi_data(city: str) -> Optional[Dict]:
+    """
+    Fetch AQI data with automatic fallback
+    
+    Try OpenAQ direct → Nearest stations → WAQI fallback
+    
+    Args:
+        city: City name
+        
+    Returns:
+        Dict with air quality data or None
+    """
+    # Try 1: OpenAQ direct lookup
+    result = fetch_from_openaq_direct(city)
+    if result:
+        return result
+
+    # Try 2: OpenAQ nearest stations
+    result = fetch_nearest_by_city(city)
+    if result:
+        return result
+
+    # Try 3: WAQI fallback
+    result = fetch_from_waqi(city)
+    if result:
+        return result
+
+    return None
+
+
+def fetch_latest_by_city(city: str) -> Optional[Dict]:
+    """Compatibility wrapper expected by app.py.
+
+    Returns a simple mapping of pollutant names to numeric values or None.
+    """
+    return fetch_aqi_data(city)
+
+def get_aqi_category(aqi: int) -> str:
+    """
+    Get AQI category string
+    
+    Args:
+        aqi: AQI value
+        
+    Returns:
+        Category string
+    """
+    if aqi <= 50:
+        return "Good"
+    elif aqi <= 100:
+        return "Moderate"
+    elif aqi <= 150:
+        return "Unhealthy for Sensitive Groups"
+    elif aqi <= 200:
+        return "Unhealthy"
+    elif aqi <= 300:
+        return "Very Unhealthy"
+    else:
+        return "Hazardous"
