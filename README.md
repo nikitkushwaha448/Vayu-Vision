@@ -1,6 +1,6 @@
-# Air-Pulse
+# Vayu-Vision
 
-Air-Pulse is a Streamlit-based air quality intelligence project focused on Indian cities. It combines city-level pollutant data, AQI prediction models, and health-risk guidance to help users understand current conditions and make safer day-to-day decisions.
+Vayu-Vision is a Streamlit-based air quality intelligence project focused on Indian cities. It combines city-level pollutant data, AQI prediction models, and health-risk guidance to help users understand current conditions and make safer day-to-day decisions.
 
 ![Air-Pulse Banner](bg3.jpg)
 
