@@ -85,21 +85,25 @@ Python 3.14 can require compiling native packages on Windows (for example pyarro
 ### 2) Create and activate virtual environment
 
 ```powershell
-py -3.11 -m venv .venv
-& .\.venv\Scripts\Activate.ps1
+py -3.11 -m venv .venv311
+& .\.venv311\Scripts\Activate.ps1
 ```
 
 ### 3) Install dependencies
 
 ```powershell
-python -m pip install --upgrade pip
-pip install -r requirements.txt
+.\.venv311\Scripts\python.exe -m pip install --upgrade pip
+.\.venv311\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 ### 4) Run the app
 
+Use VS Code: open the Run & Debug view, select "Run Air-Pulse (Streamlit)", then press F5.
+
+Or command-line:
+
 ```powershell
-python -m streamlit run app.py
+.\.venv311\Scripts\python.exe -m streamlit run app.py
 ```
 
 Open the local URL shown in terminal (typically http://localhost:8501).
@@ -133,7 +137,7 @@ python test_models.py
 Ensure your virtual environment is activated, then reinstall dependencies:
 
 ```powershell
-& .\.venv\Scripts\Activate.ps1
+& .\.venv311\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
@@ -155,3 +159,40 @@ If the v2 health pickle cannot resolve a transformer reference at runtime, the a
 ## License
 
 Add your preferred license file (for example MIT) before public reuse.
+
+## Vercel Deployment (API)
+
+This repository exposes a small API under `api/index.py` implemented with FastAPI. The `vercel.json` file maps all incoming routes to that module so Vercel's Python runtime will invoke it.
+
+Notes:
+- `api/index.py` exports both an ASGI `app` (FastAPI) and an optional `handler` (Mangum) when the `mangum` package is installed — this makes the module adaptable to several serverless execution environments.
+- To test the API locally before deploying to Vercel, use the included PowerShell helper `vercel_deploy_test.ps1` which starts `uvicorn` and exercises `/health` and `/predict`.
+
+Local test commands:
+
+```powershell
+& .\.venv311\Scripts\Activate.ps1
+.\vercel_deploy_test.ps1
+```
+
+If you plan to deploy to Vercel, ensure `requirements.txt` includes all runtime dependencies (already updated) and then follow Vercel's Python deployment docs or use the Vercel CLI to deploy from this project root.
+
+## GitHub Actions and Vercel Secrets
+
+The CI workflow in `.github/workflows/ci.yml` runs tests on every pull request and push to `main`, then deploys to Vercel after a successful `main` branch build.
+
+Before the deploy job can run, add these repository secrets in GitHub:
+
+- `VERCEL_TOKEN` - your Vercel personal token
+- `VERCEL_ORG_ID` - the Vercel team or account organization ID
+- `VERCEL_PROJECT_ID` - the Vercel project ID for this repo
+
+You can set them from the GitHub UI under Settings > Secrets and variables > Actions, or with the GitHub CLI:
+
+```powershell
+gh secret set VERCEL_TOKEN
+gh secret set VERCEL_ORG_ID
+gh secret set VERCEL_PROJECT_ID
+```
+
+If you want to deploy to a different project or branch, update the workflow file accordingly before merging to `main`.

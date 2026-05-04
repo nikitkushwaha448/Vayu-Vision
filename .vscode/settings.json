@@ -1,0 +1,11 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}\\.venv311\\Scripts\\python.exe",
+  "python.terminal.activateEnvironment": false,
+  "terminal.integrated.defaultProfile.windows": "PowerShell (Clean)",
+  "terminal.integrated.profiles.windows": {
+    "PowerShell (Clean)": {
+      "source": "PowerShell",
+      "args": []
+    }
+  }
+}
